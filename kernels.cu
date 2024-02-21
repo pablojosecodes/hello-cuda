@@ -75,4 +75,78 @@ __global__ void matmul_tiled_kernel(float* m, float* n, float* out, int h, int w
 }
 
 
+// Specifically for convolutoinal kernel (constant memory on CUDA kernel)
+__constant__ float c_M[9] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
+
+__device__ int two_to_one(int r, int c, int c_size) {
+    return r * c_size + c;  // Adjusted for correct row-major indexing
+}
+
+__global__ void conv_kernel(const float* m, float* out, int w, int h) {
+    int r = blockIdx.y * blockDim.y + threadIdx.y;
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (r < w && c < h) {
+        int index = two_to_one(r, c, h);
+
+        float c_out = 0.0f;
+        int maskIndex = 0;
+
+        for (int x = r - 1; x <= r + 1; x++) {
+            for (int y = c - 1; y <= c + 1; y++) {
+                if (x >= 0 && x < w && y >= 0 && y < h) {
+                    c_out += m[two_to_one(x, y, h)] * c_M[maskIndex];
+                }
+                maskIndex++;
+            }
+        }
+
+        out[index] = c_out;
+    }
+}
+
+// Actually parallelizable and efficient
+#define IN_TILE_DIM 32
+#define FILTER_RADIUS 1
+#define OUT_TILE_DIM (IN_TILE_DIM - 2 * FILTER_RADIUS)
+#define FILTER_DIM (2 * FILTER_RADIUS + 1)
+
+#define FILTER_DIM 3
+
+__constant__ float F[FILTER_DIM][FILTER_DIM] = {
+    {1.0f, 1.0f, 1.0f},
+    {1.0f, 1.0f, 1.0f},
+    {1.0f, 1.0f, 1.0f}
+};
+
+
+__global__ void cuda_tiled(const float *N, float *O, int width, int height) {
+    int col = blockIdx.x * OUT_TILE_DIM + threadIdx.x - FILTER_RADIUS;
+    int row = blockIdx.y * OUT_TILE_DIM + threadIdx.y - FILTER_RADIUS;
+
+    extern __shared__ float N_s[];
+
+    if (0 <= row && row < height && 0 <= col && col < width) {
+        N_s[threadIdx.y * IN_TILE_DIM + threadIdx.x] = N[row * width + col];
+    } else {
+        N_s[threadIdx.y * IN_TILE_DIM + threadIdx.x] = 0.0f;
+    }
+
+    __syncthreads();
+
+    if (0 <= col && col < width && 0 <= row && row < height) {
+        float sum = 0.0f;
+        for (int i = 0; i < FILTER_DIM; i++) {
+            for (int j = 0; j < FILTER_DIM; j++) {
+                int r = row - FILTER_RADIUS + i;
+                int c = col - FILTER_RADIUS + j;
+                if (0 <= r && r < height && 0 <= c && c < width) {
+                    sum += N_s[(threadIdx.y - FILTER_RADIUS + i) * IN_TILE_DIM + (threadIdx.x - FILTER_RADIUS + j)] * F[i][j];
+                }
+            }
+        }
+        O[row * width + col] = sum;
+    }
+}
+
 
